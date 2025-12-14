@@ -129,10 +129,77 @@ export tryEnterPosition(context) =>
 
 ## Testing Your Strategy
 
+### Strategy Backtesting
 1. **Backtest**: Use TradingView's strategy tester
 2. **Review Logs**: Check Pine Logs for detailed trade information
 3. **Export CSV**: Enable CSV printing to analyze all trades
 4. **Monitor Stats**: Win rate, P&L, drawdown, avg trade length
+
+### Unit Testing Framework
+
+The framework includes a comprehensive unit testing system for validating core functions:
+
+#### Enabling Tests
+Set the **"Test Code"** checkbox in the Debug group to run unit tests:
+```pinescript
+bool enableTestCode = input.bool(false, "Test Code", group = "Debug")
+```
+
+#### Test Features
+- ✅ **One-time execution**: Tests run only once when enabled
+- ✅ **Persistent tracking**: Test state is tracked across bars using `isTestRun` flag
+- ✅ **Visual results**: Color-coded table displays test results on chart (top-right)
+- ✅ **Automatic reset**: Tests reset when checkbox is disabled
+
+#### Built-in Test Functions
+The framework includes 9 test functions covering core utilities:
+
+1. **test_r2()** - Tests rounding to 2 decimal places
+2. **test_roundToDecimals()** - Tests custom decimal rounding
+3. **test_endsWithString()** - Tests string suffix checking
+4. **test_getPipValueForType()** - Tests pip value calculation for forex/crypto
+5. **test_getPipValueForLot()** - Tests lot-based pip value calculation
+6. **test_calculateCommission()** - Tests commission calculations
+7. **test_getLotSize()** - Tests position sizing with leverage limits
+8. **test_isTradeProfitable()** - Tests profitability validation (passing case)
+9. **test_isTradeProfitableFail()** - Tests profitability validation (failing case)
+
+#### Test Results Table
+When tests are enabled, a table displays:
+- **Summary**: "ALL TESTS PASSED ✓" (green) or "X TESTS FAILED ✗" (red)
+- **Failure details**: Function name with expected vs actual values (red background)
+- **Success message**: Confirmation when all tests pass
+
+#### Adding Custom Tests
+To test your strategy functions:
+
+```pinescript
+// Add test function after other test functions
+test_yourFunction() =>
+    testName = "yourFunction()"
+    expected = 100.0
+    actual = yourFunction(param1, param2)
+    passed = testFloatEquals(actual, expected, 0.01)
+    if not passed
+        array.push(testFailures, testName + " - Expected " + str_(expected) + ", got " + str_(actual))
+    log.info(testTag + testName + " - " + (passed ? "PASSED" : "FAILED"))
+    passed
+
+// Add call in test execution block
+if enableTestCode and not isTestRun
+    isTestRun := true
+    log.info(testTag + "Starting unit tests...")
+    
+    // ... existing test calls ...
+    test_yourFunction()  // Add your test here
+    
+    log.info(testTag + "All tests completed. Failures: " + str_(array.size(testFailures)))
+```
+
+#### Test Helper Functions
+- **testFloatEquals(actual, expected, tolerance)** - Compares floats with tolerance
+- **testFailures** - Array storing failure messages
+- **testTag** - Log prefix "[TEST] " for filtering test output
 
 ## Notes
 

@@ -28,6 +28,13 @@ var untrackedTraedsCounter = 0 // an unclear bug that should be fixed
 var string tradeStats = na
 
 // ===================================================================
+// TEST FRAMEWORK
+// ===================================================================
+var bool isTestRun = false
+var array<string> testFailures = array.new<string>()
+var string testTag = "[TEST] "
+
+// ===================================================================
 // Log Tags
 // ===================================================================
 var drawdownTag = "[drawdown] "
@@ -108,6 +115,7 @@ bool debugRunNow = input.bool(false, "Send alert on next candle closing anyway",
 enableFilter = input(false,  "Enable Backtesting Range Filtering", "Debug")
 fromDate     = input.time(timestamp("20 Jul 2025 00:00 +0300"), "Start Date", "Debug")
 toDate       = input.time(timestamp("20 Aug 2025 00:00 +0300"), "End Date", "Debug")
+bool enableTestCode = input.bool(false, "Test Code", group = "Debug", tooltip = "Run unit tests on key functions")
 
 _expectedTradeDurationInDays = input.int(3, "Avg num of days in trade", tooltip = "Should be statistics based value - used for estimated fees calculation)")
 
@@ -282,7 +290,7 @@ calculateSwapFeeShort(numOfDaysInTrade, lotSize) =>
 //   ending: The substring to look for at the end of the source string.
 // Returns:
 //   `true` if the string ends with the substring, `false` otherwise.
-ends(source, ending) =>
+endsWithString(source, ending) =>
     str.length(source) >= str.length(ending) and str.substring(source, str.length(source) - str.length(ending), str.length(source)) == ending
 
 //
@@ -297,7 +305,7 @@ calculatePNL(float lotSize, float movementPips, string tradeId) =>
     if math.abs(movementPips) < 0.0001
         log.error("movementPips = " + str_(movementPips))
 
-    isQuoteCurrencyUSD = ends(syminfo.ticker, "USD")
+    isQuoteCurrencyUSD = endsWithString(syminfo.ticker, "USD")
     quoteCurrencyToUSDConversion = 1.0
 
     standardLotSize = syminfo.type == 'forex' ? 100000 : 1
@@ -746,3 +754,198 @@ if printCsv and bar_index > selectedBarIndex and not csvAlreadyPrinted
 
     log.info(tardeLogTag + "\n" + configToString() + "\nUntracked Trades (unknown bug) = " + str_(untrackedTraedsCounter) + "\nTrade Stats:\n" + tradeStats + "\nTrade log:\n" + output)
     csvAlreadyPrinted := true
+
+// ===================================================================
+// TEST FUNCTIONS
+// ===================================================================
+
+// Test helper: compare float values with tolerance
+testFloatEquals(actual, expected, tolerance = 0.01) =>
+    math.abs(actual - expected) < tolerance
+
+// Test: r2() function
+test_r2() =>
+    testName = "r2()"
+    input1 = 123.456
+    expected = 123.46
+    actual = r2(input1)
+    passed = testFloatEquals(actual, expected, 0.001)
+    if not passed
+        array.push(testFailures, testName + " - Expected " + str_(expected) + ", got " + str_(actual))
+    log.info(testTag + testName + " - " + (passed ? "PASSED" : "FAILED"))
+    passed
+
+// Test: roundToDecimals() function
+test_roundToDecimals() =>
+    testName = "roundToDecimals()"
+    input1 = 1.23456
+    input2 = 3
+    expected = 1.235
+    actual = roundToDecimals(input1, input2)
+    passed = testFloatEquals(actual, expected, 0.0001)
+    if not passed
+        array.push(testFailures, testName + " - Expected " + str_(expected) + ", got " + str_(actual))
+    log.info(testTag + testName + " - " + (passed ? "PASSED" : "FAILED"))
+    passed
+
+// Test: endsWithString() function
+test_endsWithString() =>
+    testName = "endsWithString()"
+    passed = true
+    // Test case 1: should return true
+    if not endsWithString("EURUSD", "USD")
+        array.push(testFailures, testName + " - Expected true for endsWithString('EURUSD', 'USD')")
+        passed := false
+    // Test case 2: should return true
+    if endsWithString("USDEUR", "EUR") != true
+        array.push(testFailures, testName + " - Expected true for endsWithString('USDEUR', 'EUR')")
+        passed := false
+    // Test case 3: should return false
+    if endsWithString("EURUSD", "EUR")
+        array.push(testFailures, testName + " - Expected false for endsWithString('EURUSD', 'EUR')")
+        passed := false
+    log.info(testTag + testName + " - " + (passed ? "PASSED" : "FAILED"))
+    passed
+
+// Test: getPipValueForType() function for forex
+test_getPipValueForType() =>
+    testName = "getPipValueForType()"
+    // This test assumes we're on a forex symbol
+    expected = 0.0001 // for forex
+    actual = getPipValueForType()
+    passed = true
+    if syminfo.type == 'forex'
+        passed := testFloatEquals(actual, expected, 0.00001)
+        if not passed
+            array.push(testFailures, testName + " - Expected " + str_(expected) + ", got " + str_(actual) + " for forex")
+    log.info(testTag + testName + " - " + (passed ? "PASSED" : "FAILED"))
+    passed
+
+// Test: getPipValueForLot() function
+test_getPipValueForLot() =>
+    testName = "getPipValueForLot()"
+    expected = 10.0 // for forex/cfd
+    actual = getPipValueForLot()
+    passed = true
+    if syminfo.type == 'forex' or syminfo.type == 'cfd'
+        passed := testFloatEquals(actual, expected, 0.01)
+        if not passed
+            array.push(testFailures, testName + " - Expected " + str_(expected) + ", got " + str_(actual) + " for forex/cfd")
+    log.info(testTag + testName + " - " + (passed ? "PASSED" : "FAILED"))
+    passed
+
+// Test: calculateCommission() function
+test_calculateCommission() =>
+    testName = "calculateCommission()"
+    passed = true
+    lotSize = 0.1
+    // For EURUSD commission should be 3 per lot
+    if syminfo.ticker == "EURUSD"
+        expected = 0.3 // 0.1 lots * 3
+        actual = calculateCommission(lotSize)
+        passed := testFloatEquals(actual, expected, 0.01)
+        if not passed
+            array.push(testFailures, testName + " - Expected " + str_(expected) + ", got " + str_(actual) + " for EURUSD")
+    log.info(testTag + testName + " - " + (passed ? "PASSED" : "FAILED"))
+    passed
+
+// Test: getLotSize() function
+test_getLotSize() =>
+    testName = "getLotSize()"
+    accountSize = 100000.0
+    riskedPercent = 1.0
+    slInPips = 50.0
+    pipValueForLot = 10.0
+    expected = 20.0 // 100000 * 1 / 100 / 50 / 10 = 20
+    actual = getLotSize(accountSize, riskedPercent, slInPips, pipValueForLot)
+    // Note: actual might be capped by maxLotSize, so we check if it's <= expected
+    passed = actual <= expected and actual > 0
+    if not passed
+        array.push(testFailures, testName + " - Expected <= " + str_(expected) + ", got " + str_(actual))
+    log.info(testTag + testName + " - " + (passed ? "PASSED" : "FAILED"))
+    passed
+
+// Test: isTradeProfitable() function
+test_isTradeProfitable() =>
+    testName = "isTradeProfitable()"
+    pnl = 1000.0
+    tradeCost = 50.0 // 5% of pnl
+    [isProfitable, msg] = isTradeProfitable(pnl, tradeCost)
+    expected = true // 5% < 10% threshold
+    passed = isProfitable == expected
+    if not passed
+        array.push(testFailures, testName + " - Expected " + str_(expected) + ", got " + str_(isProfitable) + " (" + msg + ")")
+    log.info(testTag + testName + " - " + (passed ? "PASSED" : "FAILED"))
+    passed
+
+// Test: isTradeProfitable() function - unprofitable case
+test_isTradeProfitableFail() =>
+    testName = "isTradeProfitable() [unprofitable case]"
+    pnl = 1000.0
+    tradeCost = 150.0 // 15% of pnl
+    [isProfitable, msg] = isTradeProfitable(pnl, tradeCost)
+    expected = false // 15% > 10% threshold
+    passed = isProfitable == expected
+    if not passed
+        array.push(testFailures, testName + " - Expected " + str_(expected) + ", got " + str_(isProfitable) + " (" + msg + ")")
+    log.info(testTag + testName + " - " + (passed ? "PASSED" : "FAILED"))
+    passed
+
+// ===================================================================
+// TEST EXECUTION BLOCK
+// ===================================================================
+
+// Reset test state when checkbox is disabled
+if not enableTestCode
+    isTestRun := false
+    array.clear(testFailures)
+
+if enableTestCode and not isTestRun
+    isTestRun := true  // Set immediately to ensure this block runs only once
+    
+    log.info(testTag + "Starting unit tests...")
+    
+    // Run all test functions
+    test_r2()
+    test_roundToDecimals()
+    test_endsWithString()
+    test_getPipValueForType()
+    test_getPipValueForLot()
+    test_calculateCommission()
+    test_getLotSize()
+    test_isTradeProfitable()
+    test_isTradeProfitableFail()
+    
+    log.info(testTag + "All tests completed. Failures: " + str_(array.size(testFailures)))
+
+// Display test results table
+if enableTestCode
+    var table testResultsTable = table.new(position.top_right, 2, 15, border_width=1)
+    
+    if not isTestRun
+        // Header
+        table.cell(testResultsTable, 0, 0, "Test Results", bgcolor=color.new(color.blue, 20), text_color=color.white, text_size=size.normal)
+        table.cell(testResultsTable, 1, 0, "Status", bgcolor=color.new(color.blue, 20), text_color=color.white, text_size=size.normal)
+        table.cell(testResultsTable, 0, 1, "Running tests...", text_color=color.yellow, text_size=size.small)
+    else
+        failureCount = array.size(testFailures)
+        
+        // Header
+        table.cell(testResultsTable, 0, 0, "Test Results", bgcolor=color.new(color.blue, 20), text_color=color.white, text_size=size.normal)
+        table.cell(testResultsTable, 1, 0, "Status", bgcolor=color.new(color.blue, 20), text_color=color.white, text_size=size.normal)
+        
+        // Summary
+        summaryColor = failureCount == 0 ? color.green : color.red
+        summaryText = failureCount == 0 ? "ALL TESTS PASSED ✓" : str_(failureCount) + " TESTS FAILED ✗"
+        table.cell(testResultsTable, 0, 1, summaryText, bgcolor=color.new(summaryColor, 70), text_color=summaryColor, text_size=size.normal)
+        table.merge_cells(testResultsTable, 0, 1, 1, 1)
+        
+        // Display failures if any
+        if failureCount > 0
+            for i = 0 to math.min(failureCount - 1, 12)  // Show max 13 failures (rows 2-14)
+                failure = array.get(testFailures, i)
+                table.cell(testResultsTable, 0, i + 2, failure, bgcolor=color.new(color.red, 90), text_color=color.red, text_size=size.small)
+                table.merge_cells(testResultsTable, 0, i + 2, 1, i + 2)
+        else
+            table.cell(testResultsTable, 0, 2, "All 9 tests passed successfully", text_color=color.green, text_size=size.small)
+            table.merge_cells(testResultsTable, 0, 2, 1, 2)
