@@ -1,0 +1,748 @@
+// @version=6
+// Reusable Trading Strategy Framework with Trade Tracking
+// This framework provides position sizing, risk management, and trade execution
+// The strategy-specific logic is isolated for easy modification
+strategy("Breakout Candle Strategy V24", overlay=true, initial_capital=200000, default_qty_type=strategy.percent_of_equity, default_qty_value=10, pyramiding=3)
+var string fileVersion      = "v24" // extracting logic to library
+
+import Smogbreath/ImmutableDictionary/2 as dict
+import Smogbreath/CSVStorage/2 as csv
+import Smogbreath/PositionManager/31 as pm
+import Smogbreath/TimeZoneManipulation/4 as tzm
+import Smogbreath/BreakoutCandleStrategy/7 as myStrategy
+
+var pmContext = pm.NewContext()
+
+pm.ProcessBar(pmContext)
+
+string pcSecret = "8339020644565"//"8315349795029"
+
+var int[] runningId = array.new_int(1, 1)
+
+var float[] dailyPnl = array.new_float(1, 0) // persists across bars, resets upon a new day
+float[] barPnl = array.new_float(1, 0)  // resets on every bar
+var bool[] stopTradingFlag = array.new_bool(1, false) // persists across bars, resets upon a new day
+
+var untrackedTraedsCounter = 0 // an unclear bug that should be fixed
+
+var string tradeStats = na
+
+// ===================================================================
+// Log Tags
+// ===================================================================
+var drawdownTag = "[drawdown] "
+var tardeLogTag = "[trade_log] "
+var statsTag = "[stats] "
+var alertTag = "[alert] "
+var gapZone = "[GapZone] "
+
+// ===================================================================
+// TRADE TRACKING DATA STRUCTURES
+// ===================================================================
+
+// Maps to store active trades using separate dictionaries for each field
+var tradeIds = map.new<string, float>()//dict.new()      // tradeId -> tradeId (for existence check)
+
+// Statistics tracking
+var array<float> winningTradeStats = array.new<float>(2, 0.0) // [count, accumulated_gain]
+var array<float> losingTradeStats = array.new<float>(2, 0.0)  // [count, accumulated_loss]
+var array<float> tradeLengthStats = array.new<float>(2, 0.0) // [total_trades, accumulated_days]
+
+var columns = array.from("ID", "Date Start", "Date End", "Direction", "Volume", "Entry Price", "Exit Price", "pips", "P&L", "CloseReason")
+var tradeLog = csv.new(columns)
+
+// NEW: Track first and last trade times for strategy period duration
+var int firstTimeStamp = time
+
+var float maxDrawdown = na
+var float maxRunup = na
+
+// Track the last processed trade to avoid duplicate processing
+var int lastProcessedTradeIndex = -1
+
+var bool csvAlreadyPrinted = false
+
+var maximumParallelOpenTrades = 0
+
+if strategy.opentrades > maximumParallelOpenTrades
+    maximumParallelOpenTrades := strategy.opentrades
+
+// ===================================================================
+// CONFIGURATION INPUTS - Framework Settings
+// ===================================================================
+
+bool enableGapZoneBlock = input.bool(true, "Enable Gap Zone Block", group = "Gap Zone", inline = "Enable gap Zone")
+string tradeServerTimeZone = input.string("Europe/Prague", "Defaults to FTMO time Zone (CET/CEST)", group = "Gap Zone", tooltip = "The time zone in which FTMO operates - changes between GMT+2 to GMT+3\nother options are 'Asia/Jerusalem' for example", inline = "Enable gap Zone")
+int gapZoneStartHour = input.int(23, "Start Hour and Minute", group = "Gap Zone", inline = "start")
+int gapZoneStartMinute = input.int(55, "", group = "Gap Zone", inline = "start")
+int gapZoneEndHour = input.int(0, "End Hour and Minute", group = "Gap Zone", inline = "end")
+int gapZoneEndMinute = input.int(5, "", group = "Gap Zone", inline = "end")
+
+insideGapZone = tzm.isNextBarInRange(tzm.TimeRange.new(gapZoneStartHour, gapZoneStartMinute, gapZoneEndHour, gapZoneEndMinute), tradeServerTimeZone, true, true)
+
+int accumulationCandlesCount = input.int(9, "Num of candles in accumulation zone", tooltip="For 15m strategy this should be 3, and for 5m should be 9")
+
+int accountSizeForPair = input.int(150000, "Account size per Pair") // if I have an account of 200,000 and I trade 4 pairs, I would give each 50,000
+
+// A user-configurable input for the overall risk percentage (e.g., 1.0 for 1% risk).
+float totalRiskPercent = input.float(0.5, "Total Risk (%)", minval=0.01)
+
+float fvgbBiggerRatio = input.float(1, "FVGB 'bigger' ratio", tooltip = "How big is the Fair Value Gap Body than the accumulation range (default=1, i.e. - just bigger than)")
+
+float pos1 = input.float(0, "Position 1 Portion", inline="pos_1_group")
+float pos1R = input.float(0.3, "Position 1 R", inline="pos_1_group")
+
+float pos2 = input.float(1, "Position 2 Portion", inline="pos_2_group")
+float pos2R = input.float(2, "Position 2 R", inline="pos_2_group")
+
+float stopTradingDayThreshold = input.float(5, "Maximum drawdown for the day threshold (%)", tooltip = "If the total drawdown today is reaching this percent (negative) - trading is stopped for today.\nFor FTMO it is 5%")
+
+float thresholdExpanseRate = input.float(10, "Maximum trade cost threshold (%)", tooltip = "If the trade cost is above this threshold the trade is not taken")
+
+string tradesToTake = input.string(defval = "Both", title = "Type of trades to take", options = ["Long", "Short", "Both"])
+
+float strategyTesterLotSizeMultiplier = input.float(1, "Lot Size Multiplier For Strategy Tester", tooltip = "A value used to increase the lot size only in strategy objects, not alerts. This workaround because the sizes are not the same for some reason in Strategy Tester")
+
+// Debug and filtering inputs
+bool debugRunNow = input.bool(false, "Send alert on next candle closing anyway", "Debug")
+enableFilter = input(false,  "Enable Backtesting Range Filtering", "Debug")
+fromDate     = input.time(timestamp("20 Jul 2025 00:00 +0300"), "Start Date", "Debug")
+toDate       = input.time(timestamp("20 Aug 2025 00:00 +0300"), "End Date", "Debug")
+
+_expectedTradeDurationInDays = input.int(3, "Avg num of days in trade", tooltip = "Should be statistics based value - used for estimated fees calculation)")
+
+var printCsv = input.bool(false, "Print Trade Log After Bar Index", inline="csv")
+var selectedBarIndex = input.int(0, "Selected Bar Index (see table on chart)", tooltip = "Also used to add config string to stats on the specific mentioned bar", inline="csv")
+var fromRow = input.int(-1, "Print From Row", inline="csv")
+var toRow = input.int(-1, "To Row", inline="csv")
+
+
+// ===================================================================
+// STRATEGY LOGIC HERE - Replace this section for different strategies
+// ===================================================================
+
+var strategyContext = myStrategy.getContext(accumulationCandlesCount, tradesToTake, fvgbBiggerRatio)
+
+[longOrShort, stopLossDistance_] = myStrategy.tryEnterPosition(strategyContext)
+
+// ===================================================================
+// END STRATEGY LOGIC
+// ===================================================================
+
+// ===================================================================
+// HELPER FUNCTIONS - Framework Utilities
+// ===================================================================
+
+r2(num) =>
+    math.round(num, 2)
+
+str_(bValue) =>
+    str.tostring(bValue)
+
+strt(timestamp) => 
+    str.format("{0,date,yyyy-MM-dd HH:mm:ss}", timestamp) 
+
+configToString() =>
+     "[ConfigToString - v=" + fileVersion + ", Ticker=" + syminfo.ticker + ",AccountSize="+str_(accountSizeForPair)+",timeframe=" + timeframe.period + ",accumulationCandles=" + str_(accumulationCandlesCount) + ",Risked%="+str_(totalRiskPercent)+",FVGB Ratio="+str_(fvgbBiggerRatio)+",Pos1="+str_(pos1)+",Pos1R="+str_(pos1R)+",Pos2="+str_(pos2)+",Pos2R="+str_(pos2R)+",CostThreshold="+str_(thresholdExpanseRate)+",tradesToTake="+str_(tradesToTake)+",strategyTesterLotSizeMultiplier="+str_(strategyTesterLotSizeMultiplier)+",EnableTimeFilter="+str_(enableFilter)+"]"
+
+getRunningId() =>
+    int currentValue = array.get(runningId, 0)
+    int newValue = currentValue + 1
+    array.set(runningId, 0, newValue)
+    currentValue
+
+timebasedGuid() =>
+    str_(getRunningId()) + "_" + str_(math.floor(time / 10000))
+
+getPipValueForLot() =>
+    syminfo.type == 'forex' or syminfo.type == 'cfd' ? 10 : syminfo.type == 'crypto' ? 1 : 1
+
+getPipValueForType() =>
+    syminfo.type == 'forex' ? 0.0001 : syminfo.type == 'crypto' ? 1 : 1
+
+// This function calculates the point value for a given symbol, which is crucial for converting pips to price units.
+getPointValue() =>
+    syminfo.mintick * getPipValueForLot()
+    
+// Convert pips to ticks
+convertPipsToTicks(pips) =>
+    pointValue = getPointValue()
+    pips * (pointValue / syminfo.mintick)
+    
+// Round to specific decimal places (custom function)
+roundToDecimals(value, decimals) =>
+    factor = math.pow(10, decimals)
+    math.round(value * factor) / factor
+
+var assetLeverage = dict.new()
+var assetCommission = dict.new()
+var assetSwapRateLong = dict.new()
+var assetSwapRateShort = dict.new()
+var assetMinimumTradeSize = dict.new()
+
+// The leverage for asset per FTMO
+assetLeverage := dict.newWith("BTCUSD", 1)
+assetLeverage := dict.put(assetLeverage, "NZDUSD", 20)
+assetLeverage := dict.put(assetLeverage, "EURUSD", 30)
+assetLeverage := dict.put(assetLeverage, "USDCAD", 30)
+assetLeverage := dict.put(assetLeverage, "GBPUSD", 30)
+assetLeverage := dict.put(assetLeverage, "USDCHF", 30)
+
+// The commission for asset per FTMO
+assetCommission := dict.newWith("BTCUSD", 0.065)
+assetCommission := dict.put(assetCommission, "NZDUSD", 3)
+assetCommission := dict.put(assetCommission, "EURUSD", 3)
+assetCommission := dict.put(assetCommission, "USDCAD", 3)
+assetCommission := dict.put(assetCommission, "GBPUSD", 3)
+assetCommission := dict.put(assetCommission, "USDCHF", 3)
+
+// The swap rate in long for asset per FTMO
+assetSwapRateLong := dict.newWith("BTCUSD", -30)
+assetSwapRateLong := dict.put(assetSwapRateLong, "NZDUSD", -3.89)
+assetSwapRateLong := dict.put(assetSwapRateLong, "EURUSD", -10.36)
+assetSwapRateLong := dict.put(assetSwapRateLong, "USDCAD", 3.63)
+assetSwapRateLong := dict.put(assetSwapRateLong, "GBPUSD", -1.15)
+assetSwapRateLong := dict.put(assetSwapRateLong, "USDCHF", 5.02)
+
+// The swap rate in short for asset per FTMO
+assetSwapRateShort := dict.newWith("BTCUSD", -30)
+assetSwapRateShort := dict.put(assetSwapRateShort, "NZDUSD", -0.28)
+assetSwapRateShort := dict.put(assetSwapRateShort, "EURUSD", 2.99)
+assetSwapRateShort := dict.put(assetSwapRateShort, "USDCAD", -12.28)
+assetSwapRateShort := dict.put(assetSwapRateShort, "GBPUSD", -2.3)
+assetSwapRateShort := dict.put(assetSwapRateShort, "USDCHF", -13.8)
+
+// The min allowed size for asset per FTMO
+assetMinimumTradeSize := dict.put(assetMinimumTradeSize, "NZDUSD", 0.01)
+assetMinimumTradeSize := dict.put(assetMinimumTradeSize, "EURUSD", 0.01)
+assetMinimumTradeSize := dict.put(assetMinimumTradeSize, "USDCAD", 0.01)
+assetMinimumTradeSize := dict.put(assetMinimumTradeSize, "GBPUSD", 0.01)
+assetMinimumTradeSize := dict.put(assetMinimumTradeSize, "USDCHF", 0.01)
+
+var array<float> positionPortions = array.new<float>(2, 0.0)
+array.set(positionPortions, 0, pos1)
+array.set(positionPortions, 1, pos2)
+
+var array<float> positionRs = array.new<float>(2, 0.0)
+array.set(positionRs, 0, pos1R)
+array.set(positionRs, 1, pos2R)
+
+getLotSize(float accountSize, float riskedPercent, float slInPips, float pipValueForLot) => 
+    desiredLotSize = accountSize * riskedPercent / 100 / slInPips / pipValueForLot
+    maxLotSize = accountSize * dict.get(assetLeverage, syminfo.ticker) / 3 / 2 // the account size for this asset is also the available margin and I allow 3 concurrent trades each with 2 pyramid positions
+
+    lotSize = math.min(desiredLotSize, maxLotSize)
+
+    log.info("desiredLot = " + str_(desiredLotSize) + ", maxLotSize = " + str_(maxLotSize) + ", lotSize = " + str_(lotSize) + ", accountSize = " + str_(accountSize) + ", riskedPercent = " + str_(riskedPercent) + ", slInPips = " + str_(slInPips) + ", pipValueForLot = " + str_(pipValueForLot))
+    
+    lotSize
+
+calculateCommission(float lotSize) =>
+    tickerCommissionRate = dict.get(assetCommission, syminfo.ticker)
+    commission = tickerCommissionRate * lotSize
+    log.info("Calculated commission = " + str_(commission) + ", syminfo.ticker = " + syminfo.ticker + ", lotSize = " + str_(lotSize) + ", tickerCommissionRate = " + str_(tickerCommissionRate)) 
+    commission
+
+calculateSwapFee(numOfDaysInTrade, lotSize, swapRate) =>
+    float swapFee = numOfDaysInTrade * lotSize * swapRate
+    
+    // numOfDaysInTrade is the num of days I predict I'll be in the trade - per statistics that was provided in configuration
+
+    // Check if the trade started on a Wednesday.
+    // Pine Script's `dayofweek` returns 1 for Sunday, 2 for Monday, etc.
+    // Therefore, Wednesday is dayofweek == 4.
+    if dayofweek == 4
+        swapFee := swapFee + (2 * lotSize * swapRate)
+
+    swapFee
+
+calculateSwapFeeLong(numOfDaysInTrade, lotSize) =>
+    swapRate = dict.get(assetSwapRateLong, syminfo.ticker)
+
+    swapFee = calculateSwapFee(numOfDaysInTrade, lotSize, swapRate)
+
+    log.info("Calculated LONG swap fee: swapFee = " + str_(swapFee) + ", numOfDaysInTrade = " + str_(numOfDaysInTrade) + ", lotSize = " + str_(lotSize))
+
+    swapFee
+    
+calculateSwapFeeShort(numOfDaysInTrade, lotSize) =>
+    swapRate = dict.get(assetSwapRateShort, syminfo.ticker)
+
+    swapFee = calculateSwapFee(numOfDaysInTrade, lotSize, swapRate)
+
+    log.info("Calculated SHORT swap fee: swapFee = " + str_(swapFee) + ", numOfDaysInTrade = " + str_(numOfDaysInTrade) + ", lotSize = " + str_(lotSize))
+
+
+    swapFee
+
+// Checks if a string ends with a specific substring.
+//
+// Parameters:
+//   source: The string to check.
+//   ending: The substring to look for at the end of the source string.
+// Returns:
+//   `true` if the string ends with the substring, `false` otherwise.
+ends(source, ending) =>
+    str.length(source) >= str.length(ending) and str.substring(source, str.length(source) - str.length(ending), str.length(source)) == ending
+
+//
+// Parameters:
+//  lotSize: should be the trade volume - a positive number
+//  movementPips: should be negative only for a losing trade
+//  tradeId: a guid for the trade - for log tracking
+// Returns:
+//   the Profit\Loss for the trade
+calculatePNL(float lotSize, float movementPips, string tradeId) =>
+
+    if math.abs(movementPips) < 0.0001
+        log.error("movementPips = " + str_(movementPips))
+
+    isQuoteCurrencyUSD = ends(syminfo.ticker, "USD")
+    quoteCurrencyToUSDConversion = 1.0
+
+    standardLotSize = syminfo.type == 'forex' ? 100000 : 1
+
+    if not isQuoteCurrencyUSD 
+        quoteCurrencyToUSDConversion := close
+
+    pnl = lotSize * standardLotSize * getPipValueForType() * movementPips / quoteCurrencyToUSDConversion
+
+    log.info("Calculated pnl: tradeId = " + tradeId + ", pnl = " + str_(pnl) + ", syminfo.ticker = " + syminfo.ticker + ", syminfo.type = " + syminfo.type + ", quoteCurrencyToUSDConversion = " + str_(quoteCurrencyToUSDConversion) + ", lotSize = " + str_(lotSize) + ", tpPips = " + str_(movementPips))
+
+    pnl
+
+calculateTradeCost(direction, risk, tpPips, exepctedTradeDurationInDays) =>     
+    swapFee = 0.0
+
+    pnl = calculatePNL(risk, tpPips, "")
+    commission = calculateCommission(risk)
+    if direction == "Short"
+        swapFee := calculateSwapFeeShort(exepctedTradeDurationInDays, risk)
+    if direction == "Long"
+        swapFee := calculateSwapFeeLong(exepctedTradeDurationInDays, risk)
+
+    [pnl, commission + swapFee]
+
+isTradeProfitable(float pnl, float tradeCost) =>
+    expanseRate = tradeCost/pnl*100
+    isProfitable = expanseRate < thresholdExpanseRate
+    [isProfitable, "Expanse rate is " + str_(expanseRate)]
+
+raiseAlert(msg, frequency = alert.freq_once_per_bar_close) =>
+    log.warning("Raising alert with msg: '" + msg + "'")
+    alert(msg, frequency)
+
+closeAllOpenPositions(pm.Context pmContext) =>
+    log.info(gapZone + "Closing all open positions...")
+    openPositions = pm.GetOpenPositionsData(pmContext)
+
+    for op in openPositions
+        strategy.close_all(op.posId, "Close All")
+
+    posIds = array.new<string>()
+
+    for posData in openPositions
+        array.push(posIds, posData.posId)
+
+    posIdsCsv = posIds.join(",")
+
+    pm.ClosePositions(posIdsCsv, close, "Manual", pmContext)
+    
+    raiseAlert(pcSecret + ",closeall," + syminfo.ticker)
+
+// ===================================================================
+// FRAMEWORK EXECUTION - Trade Management and Execution
+// ===================================================================
+
+var c = 0
+
+// Log the ticker type.
+if c % 500 == 0
+    log.info("Ticker " + syminfo.ticker + " type is " + syminfo.type)
+c := c + 1
+
+                                // ===================================================================
+                                // Calculating Statistics
+                                // ===================================================================
+
+// resets daily P&L only on the first bar of a new day
+tryResetDailyPnl() =>
+    // FTMO daily drawdown resets at midnight CET/CEST (Central European Time)
+    cetHour = hour(time, tradeServerTimeZone)  // CET/CEST timezone
+    
+    // Check if we crossed midnight in CET/CEST timezone
+    newDay = cetHour == 0 and hour(time[1], tradeServerTimeZone) == 23
+
+    log.info(drawdownTag + "newDay = " + str_(newDay) + ", hour = " + str_(cetHour))
+    
+    if newDay
+        array.set(dailyPnl, 0, 0)
+        array.set(stopTradingFlag, 0, false)
+        log.info(drawdownTag + "Daily P&L was reset.")
+
+// Function to update daily PnL
+updateDailyPnl() =>
+    currentDailyPnl = array.get(dailyPnl, 0)
+    barPnl_ = array.get(barPnl, 0)
+    updatedDailyPnl = currentDailyPnl + barPnl_
+    array.set(dailyPnl, 0, updatedDailyPnl)
+
+    log.info(drawdownTag + "Current Daily P&L(%) = " + str_(r2(updatedDailyPnl/accountSizeForPair*100)) + " %, barPnl = " + str_(r2(barPnl_)) + ", currentDailyPnl = " + str_(r2(currentDailyPnl)) + ", updatedDailyPnl = " + str_(r2(updatedDailyPnl)))
+
+
+trackPnlForDrawdownThreshold(pnl) =>
+    currentBarPbl = array.get(barPnl,0)
+    newBarPnl = currentBarPbl + pnl
+    array.set(barPnl, 0, newBarPnl)
+
+    updateDailyPnl()
+
+    currentDailyPnl = array.get(dailyPnl, 0)
+
+    if currentDailyPnl < -stopTradingDayThreshold/100*accountSizeForPair // alerting at stopTradingDayThreshold% drawdown
+        array.set(stopTradingFlag, 0, true)
+
+tryResetDailyPnl() // performing tryReset on each and every bar we go through
+
+closedTradesOnBar = pm.removeClosedPositionsData(pmContext)
+closedPositionsCount = array.size(closedTradesOnBar)
+
+// Check for closed trades on every bar and update statistics
+if closedPositionsCount > 0
+    log.info("Newly {0} closed positions", closedPositionsCount)
+
+    // Process all new closed trades since last check
+    for tradeIndex = 0 to array.size(closedTradesOnBar) - 1 //iterating over all the trades that were closed on the previous bar
+        posData = array.get(closedTradesOnBar, tradeIndex)
+        
+        log.info(statsTag + "Processing closed trade: TradeId = " + posData.posId + ", Size=" + str.tostring(posData.size) + " Entry=" + str.tostring(posData.entryPrice) + " Exit=" + str.tostring(posData.closePrice))
+        
+        // Try to find matching trade in our active trades
+        activeTradeIds = map.keys(tradeIds)
+        foundMatch = false
+
+        // Before the loop, log the mismatch
+        if array.size(activeTradeIds) == 0// and strategy.closedtrades > 0
+            //log.warning("SYNC ISSUE: No active trades tracked but " + str.tostring(strategy.closedtrades) + " closed trades exist")
+            
+            // Log details about the untracked trade
+            log.warning(statsTag + "Untracked closed trade: ID=" + posData.posId + ", Size=" + str.tostring(posData.size) + ", Entry=" + str.tostring(posData.entryPrice) + ", Exit=" + str.tostring(posData.closePrice))
+
+            untrackedTraedsCounter := untrackedTraedsCounter + 1
+        else
+            for i = 0 to array.size(activeTradeIds) - 1
+                activeTradeID = array.get(activeTradeIds, i)
+                
+                log.info(statsTag + "Comparing with tracked trade: ID=" + activeTradeID + " closedTradeId=" + posData.posId)
+                
+                if activeTradeID == posData.posId
+
+                    isClosedTradeLong = posData.size > 0
+                    
+                    tradeMovementPips = math.abs(posData.closePrice - posData.entryPrice)/getPipValueForType()
+
+                    int lossMultiplier = na
+
+                    if posData.closeReason == "SL" // if a losing trade the pip diff sould be negative
+                        lossMultiplier := -1 // the size provided to CalculatePNL is always positive, so the pips need to be turn negative
+                    else
+                        lossMultiplier := 1
+
+                    tradeMovementPipsWithDirection = tradeMovementPips * lossMultiplier
+
+                    pnl = calculatePNL(posData.size, tradeMovementPipsWithDirection, posData.posId)
+
+                    trackPnlForDrawdownThreshold(pnl)
+
+                    //("ID", "Date Start", "Date End", "Direction", "Volume", "Entry Price", "Exit Price", "pips", "P&L", "CloseReason")
+                    
+                    entry = array.from(posData.posId, strt(posData.openedTs), strt(posData.closeTs), posData.direction, str_(posData.size), str_(posData.entryPrice), str_(posData.closePrice), str_(tradeMovementPipsWithDirection), str_(pnl), str_(posData.closeReason))
+                    csv.addRow(tradeLog, entry)
+                    
+                    // Calculate trade length in days
+                    tradeLengthMs = posData.closeTs - posData.openedTs
+                    tradeLengthDays = tradeLengthMs / (1000 * 60 * 60 * 24) // Convert milliseconds to days
+                    
+                    // Update trade length statistics
+                    totalTrades = array.get(tradeLengthStats, 0)
+                    totalDays = array.get(tradeLengthStats, 1)
+                    array.set(tradeLengthStats, 0, totalTrades + 1)
+                    array.set(tradeLengthStats, 1, totalDays + tradeLengthDays)
+                    
+                    // Update statistics
+                    if pnl > 0
+                        log.info(statsTag + "DBG: pnl > 0")
+                        // Winning trade
+                        currentCount = array.get(winningTradeStats, 0)
+                        currentGain = array.get(winningTradeStats, 1)
+                        array.set(winningTradeStats, 0, currentCount + 1)
+                        array.set(winningTradeStats, 1, currentGain + pnl)
+                        log.info(drawdownTag + statsTag + "WINNING TRADE | ID: " + activeTradeID + " | Size: " + str.tostring(posData.size) + " | Entry: " + str.tostring(posData.entryPrice) + " | Exit: " + str.tostring(posData.closePrice) + " | PnL: " + str.tostring(pnl) + " | Days: " + str.tostring(roundToDecimals(tradeLengthDays, 1)))
+                    else
+                        log.info(statsTag + "DBG: pnl < 0")
+                        // Losing trade
+                        currentCount = array.get(losingTradeStats, 0)
+                        currentLoss = array.get(losingTradeStats, 1)
+                        array.set(losingTradeStats, 0, currentCount + 1)
+                        array.set(losingTradeStats, 1, currentLoss + math.abs(pnl))
+                        log.info(drawdownTag + statsTag + "LOSING TRADE | ID: " + activeTradeID + " | Size: " + str.tostring(posData.size) + " | Entry: " + str.tostring(posData.entryPrice) + " | Exit: " + str.tostring(posData.closePrice) + " | PnL: " + str.tostring(pnl) + " | Days: " + str.tostring(roundToDecimals(tradeLengthDays, 1)))
+                    
+                    // Remove from active trades
+                    if not na(map.get(tradeIds, activeTradeID))
+                        map.remove(tradeIds, activeTradeID)
+                        log.info(statsTag + "Trade removed from tracking: " + activeTradeID)
+                    
+                    foundMatch := true
+                    break
+            
+        if not foundMatch
+            c := c+1
+            log.warning(statsTag + "WARNING: Could not find matching tracked trade for closed trade")
+    
+    // Update the last processed trade index
+    lastProcessedTradeIndex := strategy.closedtrades - 1
+
+// Log current statistics periodically
+if c % 100 == 0 or bar_index == selectedBarIndex
+    winCount = array.get(winningTradeStats, 0)
+    winGain = array.get(winningTradeStats, 1)
+    loseCount = array.get(losingTradeStats, 0)
+    loseLoss = array.get(losingTradeStats, 1)
+    totalTrades = array.get(tradeLengthStats, 0)
+    totalDays = array.get(tradeLengthStats, 1)
+    
+    avgTradeLengthDays = totalTrades > 0 ? totalDays / totalTrades : 0
+
+    mRunup = winGain - loseLoss
+    mDrawdown = loseLoss - winGain
+
+    if na(maxRunup)
+        maxRunup := mRunup
+    else if mRunup > maxRunup
+        maxRunup := mRunup
+
+    if na(maxDrawdown)
+        maxDrawdown := mDrawdown
+    else if mDrawdown > maxDrawdown
+        maxDrawdown := mDrawdown
+    
+    // Calculate strategy period duration
+    int strategyPeriodDays = na
+
+    strategyPeriodMs = time - firstTimeStamp
+    strategyPeriodDays := strategyPeriodMs / (1000 * 60 * 60 * 24)
+
+    tradeStats := "TRADE STATS | P&L: " + str_(winGain-loseLoss) + " | Win Rate (%) " + str_(roundToDecimals(winCount/(winCount+loseCount)*100,2)) + "% | Winning: " + str_(winCount) + " trades | Total Gain: " + str_(winGain) + " | Losing: " + str_(loseCount) + " trades | Total Loss: " + str_(loseLoss) + " | Max Drawdown: " + str_(maxDrawdown) + " | Max Runup: " + str_(maxRunup) + " | Avg Trade Length: " + str_(roundToDecimals(avgTradeLengthDays, 1)) + " days | Strategy Period: " + str_(na(strategyPeriodDays) ? "N/A" : str.tostring(roundToDecimals(strategyPeriodDays, 1)) + " days" + ", maximumParallelOpenTrades=" + str_(maximumParallelOpenTrades))
+    
+    if bar_index == selectedBarIndex
+        tradeStats := tradeStats + "\n" + configToString()
+
+    log.info(drawdownTag + statsTag + tradeStats)
+
+                                // ===================================================================
+                                // Calculating Statistics (END)
+                                // ===================================================================
+
+var sentCloseAllAlert = false
+
+if insideGapZone and enableGapZoneBlock
+    if not sentCloseAllAlert
+        closeAllOpenPositions(pmContext)
+        log.warning(gapZone + "Raised 'closeall' alert")
+        sentCloseAllAlert := true
+    log.warning(gapZone + "Inside gap zone - should not be opening trades")
+if not insideGapZone and enableGapZoneBlock
+    sentCloseAllAlert := false
+
+bgcolor(insideGapZone and enableGapZoneBlock ? color.new(color.purple, 90) : na, title="NZDUSD Gap Zone")
+
+tradeDateIsAllowed = not enableFilter or (time >= fromDate and time <= toDate)
+
+if enableFilter
+    c:=c+1
+    log.info("DebugNow = " + str_(debugRunNow) + ", longOrShortCondition = " + longOrShort + ", fromDate = " + strt(fromDate) + ", toDate = " + strt(toDate))
+
+// Helper function to execute a single position (extracted common logic)
+// returns [tradeId, isLong ? risk : -risk, close]
+executePosition(int positionNumber, bool isLong, float risk, float stopLossPrice, float stopLossDistance, float slPips) =>
+    
+    string direction = isLong ? "Long" : "Short"
+
+    tradeGuid = timebasedGuid()
+
+    string tradeId = direction + str_(positionNumber) + "-" + tradeGuid
+
+    shouldStopTradingForTheDay = array.get(stopTradingFlag, 0)
+
+    // trusting that trackPnlForDrawdownThreshold was already run  for this bar
+    if shouldStopTradingForTheDay
+        alert(drawdownTag + "Trading stopped for today - too close to threshold. Daily P&L = " + str_(array.get(dailyPnl,0)))
+        log.warning(drawdownTag + "Trading stopped for today - too close to threshold. Daily P&L = " + str_(array.get(dailyPnl,0)))
+
+        [tradeId, 0, na]
+
+    else    
+        // Calculate take profit based on position type
+        float takeProfitPrice = na
+        float tpPips = na
+        string action = isLong ? "buy" : "sell"
+
+        minAllowedVolume = dict.get(assetMinimumTradeSize, syminfo.ticker)
+        
+        if risk >= minAllowedVolume
+            if positionNumber <= 2
+                // Positions 1 & 2 have fixed take profits
+                float tpMultiplier = array.get(positionRs, positionNumber-1) //positionNumber == 1 ? 1.0 : 2.0
+                takeProfitPrice := isLong ? close + (stopLossDistance * tpMultiplier) : close - (stopLossDistance * tpMultiplier)
+                tpPips := slPips * tpMultiplier
+            
+            string msg = ""
+            
+            if positionNumber <= 2
+                // Regular TP positions
+                msg := pcSecret + "," + action + "," + syminfo.ticker + ",sl=" + str_(slPips) + ",tp=" + str_(tpPips) + ",risk=" + str_(risk) + ",tradeId=" + tradeId
+                log.info("Entering trade " + msg)
+                strategy.entry(tradeId, isLong ? strategy.long : strategy.short, qty=math.abs(risk) * strategyTesterLotSizeMultiplier, comment = "comment" + str_(positionNumber) + "=" + msg)
+                pm.EnterPosition(posId = tradeId, direction = isLong ? "Long" : "Short", entryPrice = close, size = risk, stopLossPips = slPips, takeProfitPips = tpPips, context = pmContext)
+                log.info("Entered position? " + msg)
+                strategy.exit("Exit" + tradeId, from_entry=tradeId, stop=stopLossPrice, limit=takeProfitPrice) //, loss = convertPipsToTicks(slPips), profit = convertPipsToTicks(tpPips)) //
+
+                // calculating the profit if the trade wins, and its expected cost if it run for an average num of trade days
+                calculateTradeCost(direction, risk, positionNumber * slPips, _expectedTradeDurationInDays)
+
+            raiseAlert(msg, alert.freq_once_per_bar_close)
+            log.info("OPEN " + direction + " " + tradeId + ": " + msg)
+            
+            // Return trade info for adding to tracking
+            [tradeId, isLong ? risk : -risk, close]
+        else
+            log.warning("Not executing position - trade size too small. PositionNumber = " + str_(positionNumber) + ", risk size = " + str_(risk) + ", minAllowedVolume = " + str_(minAllowedVolume))
+
+            [tradeId, 0, na]
+
+if tradeDateIsAllowed
+    if enableFilter
+        log.info("Debugging with enableFilter is ON")
+
+    // === TRADE EXECUTION ===
+    // Open a long position if the long condition is met.
+    if (debugRunNow and (close > open)) or (longOrShort == "Long")
+
+        log.info("OPENING LONG - 3 POSITIONS")
+        
+        float stopLossPrice = stopLossDistance_
+        float stopLossDistance = close - stopLossPrice
+        float slPips = stopLossDistance / getPointValue()
+
+        // For crypto symbols, multiply pips by 10 for PineConnector
+        if syminfo.type == 'crypto'
+            slPips := slPips * 10
+        
+        positionCapital1 = accountSizeForPair * pos1
+        positionCapital2 = accountSizeForPair * pos2
+
+        positionRisk1 = totalRiskPercent * pos1
+        positionRisk2 = totalRiskPercent * pos2
+
+        // Calculate risk percentages and quantities for each position
+        float risk1 = getLotSize(positionCapital1, positionRisk1, slPips, getPipValueForLot())
+        float risk2 = getLotSize(positionCapital2, positionRisk2, slPips, getPipValueForLot())
+        
+        log.info("Calculating total trade costs...")
+
+        // estimated gains and fees if the trade does 2R and run for an average trade duration
+        [estimatedLongPnl, estimatedLongCost] = calculateTradeCost("Long",risk1+risk2, slPips * 2, _expectedTradeDurationInDays)
+
+        [isProfitableTrade, profitabilityMsg] = isTradeProfitable(estimatedLongPnl, estimatedLongCost)
+        
+        if isProfitableTrade and not (insideGapZone and enableGapZoneBlock)
+            // Execute all three positions using the helper function
+            [tradeId1, positionSize1, entryPrice1] = executePosition(1, true, risk1, stopLossPrice, stopLossDistance, slPips)
+            [tradeId2, positionSize2, entryPrice2] = executePosition(2, true, risk2, stopLossPrice, stopLossDistance, slPips)
+            
+            // if an entryPrice is na - the trade was not taken and was not added to the strategy object => excluded from statistics
+            if not na(entryPrice1)
+                // Add trades to tracking system
+                prevValue1 = map.put(tradeIds, tradeId1, 1.0)
+                if not na(prevValue1)
+                    log.error("tradeId1 was used already. tradeId1 = " + str_(tradeId1) + ", prevValue1 = " + str_(prevValue1))
+                log.info("Trade added to tracking: " + tradeId1 + " | Trade capital: " + str_(positionCapital1) + " | Risk(%): " + str_(positionRisk1) + " | SlPips: " + str_(slPips) + " | Size: " + str_(positionSize1) + " | Entry: " + str_(entryPrice1))
+            
+            if not na(entryPrice2)
+                prevValue2 = map.put(tradeIds, tradeId2, 1.0)
+                if not na(prevValue2)
+                    log.error("tradeId2 was used already. tradeId2 = " + str_(tradeId2) + ", prevValue2 = " + str_(prevValue2))
+                log.info("Trade added to tracking: " + tradeId1 + " | Trade capital: " + str_(positionCapital2) + " | Risk(%): " + str_(positionRisk2) + " | SlPips: " + str_(slPips) + " | Size: " + str_(positionSize1) + " | Entry: " + str_(entryPrice2))
+        else
+            msg = "Long trade cancelled due to inprofitability. " + profitabilityMsg
+            raiseAlert(msg) //test
+
+    // Open a short position if the short condition is met.
+    if (debugRunNow and (close < open)) or (longOrShort == "Short")
+        log.info("OPENING SHORT - 3 POSITIONS")
+        
+        float stopLossPrice = stopLossDistance_
+        float stopLossDistance = stopLossPrice - close
+        float slPips = stopLossDistance / getPointValue()
+
+        // For crypto symbols, multiply pips by 10 for PineConnector
+        if syminfo.type == 'crypto'
+            slPips := slPips * 10
+        
+        positionCapital1 = accountSizeForPair * pos1
+        positionCapital2 = accountSizeForPair * pos2
+
+        positionRisk1 = totalRiskPercent * pos1
+        positionRisk2 = totalRiskPercent * pos2
+
+        // Calculate risk percentages and quantities for each position
+        float risk1 = getLotSize(positionCapital1, positionRisk1, slPips, getPipValueForLot())
+        float risk2 = getLotSize(positionCapital2, positionRisk2, slPips, getPipValueForLot())
+        
+        log.info("Calculating total trade costs...")
+
+        // estimated gains and fees if the trade does 2R and run for an average trade duration
+        [estimatedShortPnl, estimatedShortCost] = calculateTradeCost("Short",risk1+risk2, slPips * 2, 3)
+
+        [isProfitableTrade, profitabilityMsg] = isTradeProfitable(estimatedShortPnl, estimatedShortCost)
+
+        if isProfitableTrade and not (insideGapZone and enableGapZoneBlock)
+            // Execute all three positions using the helper function
+            [tradeId1, positionSize1, entryPrice1] = executePosition(1, false, risk1, stopLossPrice, stopLossDistance, slPips)
+            [tradeId2, positionSize2, entryPrice2] = executePosition(2, false, risk2, stopLossPrice, stopLossDistance, slPips)
+            
+            if not na(entryPrice1)
+                // Add trades to tracking system
+                prevValue1 = map.put(tradeIds, tradeId1, 1.0)
+                if not na(prevValue1)
+                    log.error("tradeId1 was used already. tradeId1 = " + str_(tradeId1) + ", prevValue1 = " + str_(prevValue1))
+                log.info("Trade added to tracking: " + tradeId1 + " | Trade capital: " + str_(positionCapital1) + " | Risk(%): " + str_(positionRisk1) + " | SlPips: " + str_(slPips) + " | Size: " + str_(positionSize1) + " | Entry: " + str_(entryPrice1))
+            
+            if not na(entryPrice2)
+                prevValue2 = map.put(tradeIds, tradeId2, 1.0)
+                if not na(prevValue2)
+                    log.error("tradeId2 was used already. tradeId2 = " + str_(tradeId2) + ", prevValue2 = " + str_(prevValue2))
+                log.info("Trade added to tracking: " + tradeId1 + " | Trade capital: " + str_(positionCapital2) + " | Risk(%): " + str_(positionRisk2) + " | SlPips: " + str_(slPips) + " | Size: " + str_(positionSize1) + " | Entry: " + str_(entryPrice2))
+            
+        else
+            msg = "Short trade cancelled due to inprofitability. " + profitabilityMsg
+            raiseAlert(msg)
+
+var table bar_index_table = table.new(position.bottom_right, 1, 1)
+int current_bar_index = bar_index
+table.cell(bar_index_table, 0, 0, "Bar Index = " + str.tostring(current_bar_index), bgcolor = color.new(#041f35, 30), text_color = color.rgb(34, 208, 89), text_halign = "center")
+
+if bar_index > selectedBarIndex 
+    log.info(tardeLogTag + "There are " + str_(csv.getRowCount(tradeLog)) + " entries in the trade log")
+
+if printCsv and bar_index > selectedBarIndex and not csvAlreadyPrinted
+
+    string output = na
+
+    if fromRow >= 0 and toRow >= 0
+        output := csv.toStringRange(tradeLog, fromRow, toRow)
+    else 
+        output := csv.toString(tradeLog)
+
+    log.info(tardeLogTag + "\n" + configToString() + "\nUntracked Trades (unknown bug) = " + str_(untrackedTraedsCounter) + "\nTrade Stats:\n" + tradeStats + "\nTrade log:\n" + output)
+    csvAlreadyPrinted := true
